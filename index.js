@@ -14,7 +14,10 @@ let isConnected = false;
 
 // Supabase Cloud Storage Details
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://jjxdsfacsotgibzcgvrn.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_2tXd0mJuMskR9zsrGvMSYw_IwWaEKsl';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
+if (!SUPABASE_KEY) {
+    console.error("⚠️ WARNING: SUPABASE_KEY is not set. WhatsApp session storage will fail.");
+}
 
 const BufferJSON = baileys.BufferJSON || {
     replacer: (k, value) => {
@@ -218,13 +221,40 @@ function loadFile(filePath) {
     return '';
 }
 
-const instructions = loadFile('instructions.txt');
-const knowledge = loadFile('knowledge.txt');
+const KB_URL = (process.env.KB_SUPABASE_URL || '').replace(/\/$/, '');
+const KB_KEY = process.env.KB_SERVICE_KEY || '';
+const KB_BUCKET = 'kb';
 
-const fullSystemInstruction = [
-    instructions,
-    knowledge ? `\n\n--- KNOWLEDGE BASE ---\n${knowledge}` : ''
-].join('').trim();
+async function readKbFile(name) {
+    const res = await fetch(`${KB_URL}/storage/v1/object/${KB_BUCKET}/${encodeURIComponent(name)}`, {
+        headers: { 'apikey': KB_KEY, 'Authorization': `Bearer ${KB_KEY}` }
+    });
+    if (!res.ok) throw new Error(`kb ${name} returned HTTP ${res.status}`);
+    return await res.text();
+}
+
+// Order: Luna.md (model instructions, from kb) -> instructions.md (WhatsApp rules, repo) -> knowledge.md (from kb)
+let systemPrompt = null;
+async function loadSystemPrompt() {
+    if (systemPrompt) return systemPrompt;
+    try {
+        if (!KB_URL || !KB_KEY) throw new Error('KB_SUPABASE_URL or KB_SERVICE_KEY is not set');
+        const luna = await readKbFile('Luna.md');
+        const knowledge = await readKbFile('knowledge.md');
+        const rules = loadFile('instructions.md');
+        if (!rules) throw new Error('instructions.md is missing from the repo');
+        systemPrompt = [
+            luna,
+            rules,
+            knowledge ? `--- KNOWLEDGE BASE ---\n${knowledge}` : ''
+        ].join('\n\n').trim();
+        console.log('System prompt loaded.');
+        return systemPrompt;
+    } catch (e) {
+        console.error('Prompt load failed:', e.message || e);
+        return null;
+    }
+}
 
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) {
@@ -232,10 +262,6 @@ if (!apiKey) {
 }
 
 const genAI = new GoogleGenerativeAI(apiKey || "");
-const model = genAI.getGenerativeModel({
-    model: "gemini-3.5-flash-lite",
-    systemInstruction: fullSystemInstruction || "You are Quix, a brilliant, witty, and helpful AI assistant."
-});
 
 async function startBot() {
     const { state, saveCreds, clearSession } = await useSupabaseAuthState();
@@ -297,6 +323,13 @@ async function startBot() {
 
             const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
             if (!text) continue;
+
+            const prompt = await loadSystemPrompt();
+            if (!prompt) {
+                await sock.sendMessage(msg.key.remoteJid, { text: "I can't load my instructions right now. Try again in a bit." }, { quoted: msg });
+                continue;
+            }
+            const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash-lite", systemInstruction: prompt });
 
             try {
                 const result = await model.generateContent(text);
