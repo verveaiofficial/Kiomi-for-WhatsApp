@@ -5,6 +5,7 @@ const QRCode = require('qrcode');
 const express = require('express');
 const pino = require('pino');
 const fs = require('fs');
+const { createChatMemory } = require('./chatMemory');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -18,6 +19,8 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
 if (!SUPABASE_KEY) {
     console.error("⚠️ WARNING: SUPABASE_KEY is not set. WhatsApp session storage will fail.");
 }
+
+const chatMemory = createChatMemory({ url: SUPABASE_URL, key: SUPABASE_KEY, limit: 20 });
 
 const BufferJSON = baileys.BufferJSON || {
     replacer: (k, value) => {
@@ -330,13 +333,17 @@ async function startBot() {
                 continue;
             }
             const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash-lite", systemInstruction: prompt });
+            const jid = msg.key.remoteJid;
+            const history = await chatMemory.load(jid);
 
             try {
-                const result = await model.generateContent(text);
+                const chat = model.startChat({ history });
+                const result = await chat.sendMessage(text);
                 const responseText = result.response.text();
 
                 if (responseText) {
-                    await sock.sendMessage(msg.key.remoteJid, { text: responseText }, { quoted: msg });
+                    await sock.sendMessage(jid, { text: responseText }, { quoted: msg });
+                    await chatMemory.append(jid, history, text, responseText);
                 } else {
                     await sock.sendMessage(msg.key.remoteJid, { text: "Hmm, got an empty thought back. Try again!" }, { quoted: msg });
                 }
