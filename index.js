@@ -8,6 +8,15 @@ const fs = require('fs');
 const { createChatMemory } = require('./chatMemory');
 
 const app = express();
+
+// Keep the service alive when a single WhatsApp message or socket event throws
+// (e.g. libsignal "SessionError: No sessions"). Log it instead of crashing.
+process.on('unhandledRejection', (err) => {
+    console.error('Unhandled rejection (kept alive):', err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception (kept alive):', err?.message || err);
+});
 const PORT = process.env.PORT || 8080;
 
 let latestQR = null;
