@@ -1,7 +1,7 @@
 // Per-chat memory for the WhatsApp bot. Stores the last N messages in the
 // existing wa_auth table (id = "chat-<jid>", data = { messages: [...] }).
-// Messages use Gemini's own { role, parts } format so they can be passed
-// straight into model.startChat({ history }).
+// Messages use OpenAI-style { role, content } ("user" / "assistant").
+// Rows saved earlier in Gemini's { role, parts } format are converted on read.
 
 function createChatMemory({ url, key, limit = 20 }) {
     const rowId = (jid) => `chat-${jid}`;
@@ -12,7 +12,16 @@ function createChatMemory({ url, key, limit = 20 }) {
         'Content-Type': 'application/json'
     });
 
-    // Keep the newest `limit` messages and make sure history starts with a user turn (Gemini requires it).
+    // Convert old Gemini-format entries ({ role: 'model', parts }) to OpenAI format.
+    const toOpenAI = (m) => {
+        const role = m.role === 'model' || m.role === 'assistant' ? 'assistant' : 'user';
+        const content = m.content !== undefined
+            ? m.content
+            : (m.parts || []).map(p => p.text || '').join('');
+        return { role, content };
+    };
+
+    // Keep the newest `limit` messages and make sure history starts with a user turn.
     const trim = (messages) => {
         let out = messages.slice(-limit);
         while (out.length && out[0].role !== 'user') out = out.slice(1);
@@ -28,7 +37,7 @@ function createChatMemory({ url, key, limit = 20 }) {
             if (!res.ok) return [];
             const rows = await res.json();
             const messages = rows?.[0]?.data?.messages;
-            return Array.isArray(messages) ? trim(messages) : [];
+            return Array.isArray(messages) ? trim(messages.map(toOpenAI).filter(m => m.content)) : [];
         } catch (e) {
             console.error('Chat memory read error:', e.message || e);
             return [];
@@ -48,11 +57,11 @@ function createChatMemory({ url, key, limit = 20 }) {
         }
     };
 
-    // Called only after a successful reply, so a failed Gemini call never leaves a dangling user turn.
+    // Called only after a successful reply, so a failed API call never leaves a dangling user turn.
     const append = (jid, history, userText, botText) => save(jid, [
         ...history,
-        { role: 'user', parts: [{ text: userText }] },
-        { role: 'model', parts: [{ text: botText }] }
+        { role: 'user', content: userText },
+        { role: 'assistant', content: botText }
     ]);
 
     return { load, save, append, trim };

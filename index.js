@@ -1,5 +1,5 @@
 const baileys = require('@whiskeysockets/baileys');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const OpenAI = require('openai');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const express = require('express');
@@ -259,12 +259,16 @@ async function loadSystemPrompt() {
     }
 }
 
-const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey) {
-    console.error("⚠️ WARNING: GEMINI_API_KEY is not set in environment variables!");
+const nvidiaKey = process.env.NVIDIA_API_KEY;
+if (!nvidiaKey) {
+    console.error("⚠️ WARNING: NVIDIA_API_KEY is not set in environment variables!");
 }
 
-const genAI = new GoogleGenerativeAI(apiKey || "");
+// NVIDIA NIM API is OpenAI-compatible
+const nvidia = new OpenAI({
+    baseURL: 'https://integrate.api.nvidia.com/v1',
+    apiKey: nvidiaKey || ""
+});
 
 async function startBot() {
     const { state, saveCreds, clearSession } = await useSupabaseAuthState();
@@ -332,14 +336,22 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, { text: "I can't load my instructions right now. Try again in a bit." }, { quoted: msg });
                 continue;
             }
-            const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash-lite", systemInstruction: prompt });
             const jid = msg.key.remoteJid;
             const history = await chatMemory.load(jid);
 
             try {
-                const chat = model.startChat({ history });
-                const result = await chat.sendMessage(text);
-                const responseText = result.response.text();
+                const completion = await nvidia.chat.completions.create({
+                    model: "nvidia/nemotron-3.5-bolt-e4b",
+                    messages: [
+                        { role: 'system', content: prompt },
+                        ...history,
+                        { role: 'user', content: text }
+                    ],
+                    max_tokens: 1024,
+                    temperature: 0.7,
+                    chat_template_kwargs: { enable_thinking: false }
+                });
+                const responseText = completion.choices?.[0]?.message?.content?.trim();
 
                 if (responseText) {
                     await sock.sendMessage(jid, { text: responseText }, { quoted: msg });
@@ -348,7 +360,7 @@ async function startBot() {
                     await sock.sendMessage(msg.key.remoteJid, { text: "Hmm, got an empty thought back. Try again!" }, { quoted: msg });
                 }
             } catch (error) {
-                console.error('❌ GEMINI API ERROR DETAILS:', error.message || error);
+                console.error('❌ NVIDIA API ERROR DETAILS:', error.message || error);
                 await sock.sendMessage(msg.key.remoteJid, { text: `Error: ${error.message || "Failed to process"}` }, { quoted: msg });
             }
         }
