@@ -1,3 +1,4 @@
+const path = require('path');
 const baileys = require('@whiskeysockets/baileys');
 const OpenAI = require('openai');
 const qrcodeTerminal = require('qrcode-terminal');
@@ -17,19 +18,29 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
     console.error('Uncaught exception (kept alive):', err?.message || err);
 });
+
 const PORT = process.env.PORT || 8080;
+const BOT_NAME = process.env.BOT_NAME || 'WhatsApp Bot';
+
+// One shared Supabase project serves every bot. BOT_ID prefixes all rows,
+// so bots never read or delete each other's data.
+const BOT_ID = (process.env.BOT_ID || '').trim();
+if (!/^[a-z0-9-]+$/.test(BOT_ID)) {
+    console.error('⚠️ FATAL: BOT_ID must be set, using only lowercase letters, numbers and dashes (e.g. kiomi-client1).');
+    process.exit(1);
+}
+const ROW_PREFIX = `${BOT_ID}:`;
 
 let latestQR = null;
 let isConnected = false;
 
-// Supabase Cloud Storage Details
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://jjxdsfacsotgibzcgvrn.supabase.co';
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
-if (!SUPABASE_KEY) {
-    console.error("⚠️ WARNING: SUPABASE_KEY is not set. WhatsApp session storage will fail.");
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error('⚠️ WARNING: SUPABASE_URL or SUPABASE_KEY is not set. WhatsApp session storage will fail.');
 }
 
-const chatMemory = createChatMemory({ url: SUPABASE_URL, key: SUPABASE_KEY, limit: 20 });
+const chatMemory = createChatMemory({ url: SUPABASE_URL, key: SUPABASE_KEY, botId: BOT_ID, limit: 20 });
 
 const BufferJSON = baileys.BufferJSON || {
     replacer: (k, value) => {
@@ -61,9 +72,12 @@ async function useSupabaseAuthState() {
         return await fetch(url, options);
     };
 
+    // Every auth row id is prefixed with this bot's BOT_ID.
+    const rowId = (id) => `${ROW_PREFIX}${id}`;
+
     const readData = async (id) => {
         try {
-            const res = await fetchSupabase(`wa_auth?id=eq.${encodeURIComponent(id)}&select=data`);
+            const res = await fetchSupabase(`wa_auth?id=eq.${encodeURIComponent(rowId(id))}&select=data`);
             if (!res.ok) return null;
             const rows = await res.json();
             if (Array.isArray(rows) && rows.length > 0 && rows[0].data) {
@@ -82,7 +96,7 @@ async function useSupabaseAuthState() {
                 method: 'POST',
                 headers: { 'Prefer': 'resolution=merge-duplicates' },
                 body: JSON.stringify({
-                    id,
+                    id: rowId(id),
                     data: JSON.parse(JSON.stringify(data, BufferJSON.replacer))
                 })
             });
@@ -93,7 +107,7 @@ async function useSupabaseAuthState() {
 
     const removeData = async (id) => {
         try {
-            await fetchSupabase(`wa_auth?id=eq.${encodeURIComponent(id)}`, {
+            await fetchSupabase(`wa_auth?id=eq.${encodeURIComponent(rowId(id))}`, {
                 method: 'DELETE'
             });
         } catch (e) {
@@ -101,9 +115,10 @@ async function useSupabaseAuthState() {
         }
     };
 
+    // Only deletes this bot's rows (ids starting with BOT_ID:), never other bots'.
     const clearAllData = async () => {
         try {
-            await fetchSupabase('wa_auth?id=neq.none', {
+            await fetchSupabase(`wa_auth?id=like.${ROW_PREFIX}*`, {
                 method: 'DELETE'
             });
         } catch (e) {
@@ -162,7 +177,7 @@ app.get('/', async (req, res) => {
     if (isConnected) {
         return res.send(`
             <div style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #0f172a; color: #fff; min-height: 100vh;">
-                <h1 style="color: #4ade80;">🚀 Quix WhatsApp Bot is Active & Connected!</h1>
+                <h1 style="color: #4ade80;">🚀 ${BOT_NAME} is Active & Connected!</h1>
             </div>
         `);
     }
@@ -174,7 +189,7 @@ app.get('/', async (req, res) => {
                 <!DOCTYPE html>
                 <html>
                 <head>
-                    <title>Quix WhatsApp Setup</title>
+                    <title>${BOT_NAME} Setup</title>
                     <meta name="viewport" content="width=device-width, initial-scale=1.0">
                     <meta http-equiv="refresh" content="15">
                     <style>
@@ -216,8 +231,8 @@ app.get('/', async (req, res) => {
 });
 
 const server = app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    
+    console.log(`Server running on port ${PORT} (bot: ${BOT_ID})`);
+
     setInterval(() => {
         const renderUrl = process.env.RENDER_EXTERNAL_URL;
         if (renderUrl) {
@@ -233,39 +248,34 @@ function loadFile(filePath) {
     return '';
 }
 
-const KB_URL = (process.env.KB_SUPABASE_URL || '').replace(/\/$/, '');
-const KB_KEY = process.env.KB_SERVICE_KEY || '';
-const KB_BUCKET = 'kb';
+// Prompt comes only from the repo: instructions.md (rules) + knowledge.md (client info).
+const RULES_PATH = path.join(__dirname, 'instructions.md');
+const KNOWLEDGE_PATH = path.join(__dirname, 'knowledge.md');
 
-async function readKbFile(name) {
-    const res = await fetch(`${KB_URL}/storage/v1/object/${KB_BUCKET}/${encodeURIComponent(name)}`, {
-        headers: { 'apikey': KB_KEY, 'Authorization': `Bearer ${KB_KEY}` }
-    });
-    if (!res.ok) throw new Error(`kb ${name} returned HTTP ${res.status}`);
-    return await res.text();
-}
-
-// Order: Luna.md (model instructions, from kb) -> instructions.md (WhatsApp rules, repo) -> knowledge.md (from kb)
 let systemPrompt = null;
-async function loadSystemPrompt() {
+function loadSystemPrompt() {
     if (systemPrompt) return systemPrompt;
-    try {
-        if (!KB_URL || !KB_KEY) throw new Error('KB_SUPABASE_URL or KB_SERVICE_KEY is not set');
-        const luna = await readKbFile('Luna.md');
-        const knowledge = await readKbFile('knowledge.md');
-        const rules = loadFile('instructions.md');
-        if (!rules) throw new Error('instructions.md is missing from the repo');
-        systemPrompt = [
-            luna,
-            rules,
-            knowledge ? `--- KNOWLEDGE BASE ---\n${knowledge}` : ''
-        ].join('\n\n').trim();
-        console.log('System prompt loaded.');
-        return systemPrompt;
-    } catch (e) {
-        console.error('Prompt load failed:', e.message || e);
+    const rules = loadFile(RULES_PATH);
+    if (!rules) {
+        console.error('Prompt load failed: instructions.md is missing from the repo');
         return null;
     }
+    const knowledge = loadFile(KNOWLEDGE_PATH);
+    systemPrompt = [
+        rules,
+        knowledge ? `--- KNOWLEDGE BASE ---\n${knowledge}` : ''
+    ].join('\n\n').trim();
+    console.log('System prompt loaded.');
+    return systemPrompt;
+}
+
+// Only one-to-one chats get replies: skip groups, status updates, broadcasts and newsletters.
+function isIgnoredChat(jid) {
+    return !jid
+        || jid === 'status@broadcast'
+        || jid.endsWith('@g.us')
+        || jid.endsWith('@broadcast')
+        || jid.endsWith('@newsletter');
 }
 
 const nvidiaKey = process.env.NVIDIA_API_KEY;
@@ -303,7 +313,7 @@ async function startBot() {
         if (qr) {
             latestQR = qr;
             isConnected = false;
-            console.log('\n--- NEW QR GENERATED! VISIT YOUR RENDER URL TO SCAN ---');
+            console.log(`\n--- NEW QR GENERATED (${BOT_ID})! VISIT YOUR RENDER URL TO SCAN ---`);
             qrcodeTerminal.generate(qr, { small: true });
         }
 
@@ -315,7 +325,7 @@ async function startBot() {
             console.log(`Connection closed (${statusCode || 'Unknown'}). Reconnecting...`);
 
             if (statusCode === baileys.DisconnectReason.loggedOut) {
-                console.log('Device logged out. Clearing Supabase session...');
+                console.log('Device logged out. Clearing this bot\'s Supabase session...');
                 await clearSession();
             }
 
@@ -327,7 +337,7 @@ async function startBot() {
         } else if (connection === 'open') {
             isConnected = true;
             latestQR = null;
-            console.log('\n🚀 Quix is live on WhatsApp (Backed by Supabase)! 🚀\n');
+            console.log(`\n🚀 ${BOT_NAME} is live on WhatsApp (${BOT_ID}) 🚀\n`);
         }
     });
 
@@ -335,17 +345,17 @@ async function startBot() {
         if (type !== 'notify') return;
 
         for (const msg of messages) {
-            if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+            const jid = msg.key.remoteJid;
+            if (msg.key.fromMe || isIgnoredChat(jid)) continue;
 
             const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
             if (!text) continue;
 
-            const prompt = await loadSystemPrompt();
+            const prompt = loadSystemPrompt();
             if (!prompt) {
-                await sock.sendMessage(msg.key.remoteJid, { text: "I can't load my instructions right now. Try again in a bit." }, { quoted: msg });
+                await sock.sendMessage(jid, { text: "I can't load my instructions right now. Try again in a bit." }, { quoted: msg });
                 continue;
             }
-            const jid = msg.key.remoteJid;
             const history = await chatMemory.load(jid);
 
             try {
@@ -366,11 +376,11 @@ async function startBot() {
                     await sock.sendMessage(jid, { text: responseText }, { quoted: msg });
                     await chatMemory.append(jid, history, text, responseText);
                 } else {
-                    await sock.sendMessage(msg.key.remoteJid, { text: "Hmm, got an empty thought back. Try again!" }, { quoted: msg });
+                    await sock.sendMessage(jid, { text: "Hmm, got an empty thought back. Try again!" }, { quoted: msg });
                 }
             } catch (error) {
                 console.error('❌ NVIDIA API ERROR DETAILS:', error.message || error);
-                await sock.sendMessage(msg.key.remoteJid, { text: `Error: ${error.message || "Failed to process"}` }, { quoted: msg });
+                await sock.sendMessage(jid, { text: `Error: ${error.message || "Failed to process"}` }, { quoted: msg });
             }
         }
     });
