@@ -1,9 +1,10 @@
-// Per-chat memory for the bot. Stores the last N messages in the shared wa_auth table
-// (id = "<BOT_ID>:chat-<jid>", data = { messages: [...] }).
+// Per-chat memory for the WhatsApp bot. Stores the last N messages in the
+// existing wa_auth table (id = "chat-<jid>", data = { messages: [...] }).
 // Messages use OpenAI-style { role, content } ("user" / "assistant").
+// Rows saved earlier in Gemini's { role, parts } format are converted on read.
 
-function createChatMemory({ url, key, botId, limit = 20 }) {
-    const rowId = (jid) => `${botId}:chat-${jid}`;
+function createChatMemory({ url, key, limit = 20 }) {
+    const rowId = (jid) => `chat-${jid}`;
 
     const headers = () => ({
         'apikey': key,
@@ -11,6 +12,7 @@ function createChatMemory({ url, key, botId, limit = 20 }) {
         'Content-Type': 'application/json'
     });
 
+    // Convert old Gemini-format entries ({ role: 'model', parts }) to OpenAI format.
     const toOpenAI = (m) => {
         const role = m.role === 'model' || m.role === 'assistant' ? 'assistant' : 'user';
         const content = m.content !== undefined

@@ -1,7 +1,7 @@
 {
-  "name": "whatsapp-bot-template",
+  "name": "quix-whatsapp",
   "version": "1.0.0",
-  "description": "WhatsApp AI bot template. One repo per bot, BOT_ID prefixes shared Supabase rows.",
+  "description": "Quix WhatsApp Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
